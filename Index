@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Now playing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#000;--fg:#fff;--muted:#8a8a8a;--track:#2b2b2b;--art-bg:#161616}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font-family:"Familjen Grotesk",system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+main{width:100%;max-width:420px;display:flex;flex-direction:column;gap:28px}
+.profile{display:flex;align-items:center;gap:12px;text-decoration:none;color:inherit}
+.profile img{width:44px;height:44px;border-radius:50%;object-fit:cover;background:var(--art-bg)}
+.profile b{display:block;font-weight:600;font-size:1rem}
+.profile span{color:var(--muted);font-size:.875rem}
+.art{width:100%;aspect-ratio:1;border-radius:4px;background:var(--art-bg);object-fit:cover;display:block}
+.meta h1{font-size:1.75rem;line-height:1.1;font-weight:700;letter-spacing:-.01em}
+.meta p{color:var(--muted);margin-top:6px;font-size:1.0625rem}
+.meta a{color:inherit;text-decoration:none}
+.meta a:hover,.meta a:focus-visible{text-decoration:underline}
+.bar{display:flex;align-items:center;gap:10px;font-size:.75rem;color:var(--fg);font-variant-numeric:tabular-nums}
+.track{flex:1;height:4px;background:var(--track);border-radius:2px;overflow:hidden}
+.fill{height:100%;width:0;background:var(--fg);border-radius:2px}
+.idle{color:var(--muted)}
+button{font:inherit;font-weight:600;background:var(--fg);color:#000;border:0;border-radius:999px;padding:14px 28px;cursor:pointer}
+button:focus-visible,a:focus-visible{outline:2px solid #fff;outline-offset:3px}
+.login{text-align:center;display:flex;flex-direction:column;gap:20px;align-items:center}
+.login h1{font-size:1.75rem}
+.err{color:#ff7a7a;font-size:.9rem}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <section class="login" id="login" hidden>
+    <h1>Connect Spotify to show what you're playing</h1>
+    <button id="loginBtn">Connect Spotify</button>
+    <p class="err" id="err" hidden></p>
+  </section>
+
+  <section id="app" hidden style="display:contents">
+    <a class="profile" id="profile" target="_blank" rel="noopener">
+      <img id="avatar" alt="">
+      <div><b id="name"></b><span id="followers"></span></div>
+    </a>
+    <img class="art" id="art" alt="Album cover">
+    <div class="meta">
+      <h1 id="title">Nothing playing</h1>
+      <p id="artist" class="idle">Start a song on Spotify and it will show up here.</p>
+    </div>
+    <div class="bar" aria-label="Playback progress">
+      <span id="cur">0:00</span>
+      <div class="track"><div class="fill" id="fill"></div></div>
+      <span id="dur">0:00</span>
+    </div>
+  </section>
+</main>
+
+<script>
+// 1) Paste your Client ID from developer.spotify.com/dashboard
+const CLIENT_ID = "YOUR_SPOTIFY_CLIENT_ID";
+// 2) This page's own URL must be added as a Redirect URI in your Spotify app
+const REDIRECT_URI = location.origin + location.pathname;
+const SCOPES = "user-read-currently-playing user-read-playback-state user-read-private";
+
+const $ = id => document.getElementById(id);
+const store = {
+  get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+  del: k => { try { localStorage.removeItem(k); } catch {} }
+};
+
+// ---------- PKCE auth ----------
+const rand = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[b % 62]).join("");
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+async function login() {
+  const verifier = rand(64);
+  store.set("verifier", verifier);
+  const challenge = b64(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  location.href = "https://accounts.spotify.com/authorize?" + new URLSearchParams({
+    client_id: CLIENT_ID, response_type: "code", redirect_uri: REDIRECT_URI,
+    scope: SCOPES, code_challenge_method: "S256", code_challenge: challenge
+  });
+}
+
+async function tokenRequest(params) {
+  const r = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: CLIENT_ID, ...params })
+  });
+  if (!r.ok) throw new Error("Token request failed");
+  const d = await r.json();
+  store.set("access", d.access_token);
+  store.set("expires", Date.now() + d.expires_in * 1000 - 60000);
+  if (d.refresh_token) store.set("refresh", d.refresh_token);
+}
+
+async function getToken() {
+  if (store.get("access") && Date.now() < +store.get("expires")) return store.get("access");
+  if (!store.get("refresh")) return null;
+  try { await tokenRequest({ grant_type: "refresh_token", refresh_token: store.get("refresh") }); }
+  catch { ["access", "refresh", "expires"].forEach(store.del); return null; }
+  return store.get("access");
+}
+
+async function api(path) {
+  const t = await getToken();
+  if (!t) throw new Error("auth");
+  const r = await fetch("https://api.spotify.com/v1" + path, { headers: { Authorization: "Bearer " + t } });
+  if (r.status === 204) return null;
+  if (r.status === 401) { store.del("access"); store.del("expires"); throw new Error("auth"); }
+  if (!r.ok) throw new Error("api " + r.status);
+  return r.json();
+}
+
+// ---------- UI ----------
+const fmt = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+let track = null, progress = 0, playing = false, stamp = 0;
+
+function render() {
+  if (!track) return;
+  const p = Math.min(track.duration_ms, progress + (playing ? Date.now() - stamp : 0));
+  $("cur").textContent = fmt(p);
+  $("dur").textContent = fmt(track.duration_ms);
+  $("fill").style.width = (p / track.duration_ms * 100) + "%";
+}
+
+function setTrack(t) {
+  track = t;
+  $("title").innerHTML = "";
+  if (!t) {
+    $("title").textContent = "Nothing playing";
+    $("artist").textContent = "Start a song on Spotify and it will show up here.";
+    $("artist").className = "idle";
+    $("art").removeAttribute("src");
+    $("cur").textContent = $("dur").textContent = "0:00";
+    $("fill").style.width = "0";
+    document.title = "Now playing";
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = t.external_urls.spotify; a.target = "_blank"; a.rel = "noopener"; a.textContent = t.name;
+  $("title").appendChild(a);
+  $("artist").className = "";
+  $("artist").textContent = t.artists.map(x => x.name).join(", ");
+  $("art").src = (t.album.images[0] || {}).url || "";
+  document.title = t.name + " – " + $("artist").textContent;
+}
+
+async function poll() {
+  try {
+    const d = await api("/me/player/currently-playing");
+    if (!d || !d.item || d.currently_playing_type !== "track") { playing = false; setTrack(null); return; }
+    if (!track || track.id !== d.item.id) setTrack(d.item);
+    progress = d.progress_ms; playing = d.is_playing; stamp = Date.now();
+    render();
+  } catch (e) {
+    if (e.message === "auth") show("login");
+  }
+}
+
+async function loadProfile() {
+  const me = await api("/me");
+  $("name").textContent = me.display_name || me.id;
+  $("followers").textContent = (me.followers ? me.followers.total : 0) + " followers";
+  const img = (me.images && me.images[0]) ? me.images[0].url : "";
+  if (img) $("avatar").src = img;
+  $("profile").href = me.external_urls.spotify;
+}
+
+function show(which) {
+  $("login").hidden = which !== "login";
+  $("app").hidden = which !== "app";
+}
+
+async function init() {
+  $("loginBtn").onclick = login;
+  const qs = new URLSearchParams(location.search);
+  if (qs.get("error")) { show("login"); $("err").hidden = false; $("err").textContent = "Spotify said: " + qs.get("error"); return; }
+  if (qs.get("code")) {
+    try {
+      await tokenRequest({ grant_type: "authorization_code", code: qs.get("code"), redirect_uri: REDIRECT_URI, code_verifier: store.get("verifier") || "" });
+    } catch { $("err").hidden = false; $("err").textContent = "Couldn't sign in. Check your Client ID and Redirect URI."; }
+    history.replaceState({}, "", REDIRECT_URI);
+  }
+  if (!(await getToken())) { show("login"); return; }
+  show("app");
+  try { await loadProfile(); } catch {}
+  poll();
+  setInterval(poll, 5000);
+  setInterval(render, 500);
+}
+init();
+</script>
+</body>
+</html>
